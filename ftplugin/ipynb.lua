@@ -8,6 +8,7 @@ vim.bo.commentstring = "# %s"
 
 local ipynb = require("ipynb-nvim")
 local run = require("ipynb-run-nvim")
+local lsp = require("ipynb-lsp-nvim")
 local bufnr = vim.api.nvim_get_current_buf()
 local opts = { buffer = true }
 
@@ -21,14 +22,32 @@ vim.keymap.set("n", "<leader>nm", function() ipynb.toggle_cell_type() end, opts)
 vim.keymap.set("n", "<leader>nr", run.run_cell, { buffer = true, desc = "Run current cell (browser output)" })
 vim.keymap.set("n", "<leader>nR", run.run_all_cells, { buffer = true, desc = "Run all cells (browser output)" })
 
--- Keep border bars/header styling and cell-number labels in sync with manual
--- edits (typing, dd-ing a header line, etc.) that don't go through the
--- commands above.
+-- LSP (ipynb-lsp-nvim), proxied to a hidden shadow buffer pyright attaches to.
+-- The real buffer itself never gets a direct LspAttach, so these don't
+-- conflict with the global K/gd bound in lua/config/lsp.lua for plain .py files.
+lsp.attach(bufnr)
+vim.keymap.set("n", "K", lsp.hover, { buffer = true, desc = "Hover (pyright, via shadow buffer)" })
+vim.keymap.set("n", "gd", lsp.goto_definition, { buffer = true, desc = "Go to definition (pyright, via shadow buffer)" })
+
+-- Keep border bars/header styling, cell-number labels, and the LSP shadow
+-- buffer in sync with manual edits (typing, dd-ing a header line, etc.) that
+-- don't go through the commands above.
 run.render_cell_numbers(bufnr)
 vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "InsertLeave" }, {
   buffer = bufnr,
   callback = function()
     ipynb.render_decorations(bufnr)
     run.render_cell_numbers(bufnr)
+    lsp.schedule_sync(bufnr)
+  end,
+})
+
+-- Force an immediate (non-debounced) resync right after saving, so
+-- diagnostics are guaranteed fully current at the moment you save rather
+-- than possibly lagging behind the debounce timer.
+vim.api.nvim_create_autocmd("BufWritePost", {
+  buffer = bufnr,
+  callback = function()
+    lsp.sync_now(bufnr)
   end,
 })

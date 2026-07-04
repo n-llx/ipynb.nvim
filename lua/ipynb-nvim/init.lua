@@ -287,10 +287,11 @@ end
 -- (typing, dd-ing a header line, etc.) that don't go through the commands above.
 M.render_decorations = render_decorations
 
--- Exposed so sibling plugins (e.g. ipynb-run-nvim) can find cell boundaries
--- without duplicating this parsing logic.
+-- Exposed so sibling plugins (e.g. ipynb-run-nvim, ipynb-lsp-nvim) can find
+-- cell boundaries without duplicating this parsing logic.
 M.is_header = is_header
 M.current_cell_bounds = current_cell_bounds
+M.header_is_markdown = header_is_markdown
 
 function M.setup()
   set_highlights()
