@@ -1,240 +1,110 @@
-# ipynb.nvim
+# marimo.nvim
 
-A from-scratch Neovim plugin for editing and running Jupyter (`.ipynb`) notebooks,
-built to be fully understood rather than assembled from existing tools like
-`jupytext`. Three parts, one repo:
+A thin Neovim plugin for working with [marimo](https://marimo.io) notebooks — real,
+plain `.py` files where cells are `@app.cell`-decorated functions, not JSON, not
+comment markers.
 
-- **`ipynb-nvim`** — renders `.ipynb` files as editable plain text, with real syntax
-  highlighting and a beautiful cell layout.
-- **`ipynb-run-nvim`** — runs cells against a real Python kernel and shows the results
-  (text, errors, images, interactive Plotly charts, anything) in a browser tab.
-- **`ipynb-lsp-nvim`** — real pyright diagnostics, hover, go-to-definition, and
-  completion inside `.ipynb` buffers, via a hidden shadow buffer.
+This plugin used to be a much larger, fully custom notebook system: a hand-built
+`.ipynb` JSON↔text transform, a custom aiohttp+Jupyter kernel execution server with
+its own browser page, and a shadow-buffer LSP proxy to get pyright working around a
+custom filetype. All of that is gone. Because marimo notebooks are genuinely valid
+Python, pyright attaches to them **natively**, through whatever LSP config you
+already have — zero plugin code involved. And because `marimo edit --watch` already
+provides a mature kernel, reactive execution, and a polished browser UI, there's
+nothing left to build there either. What remains is small on purpose.
 
-`ipynb-run-nvim` and `ipynb-lsp-nvim` both depend on `ipynb-nvim`'s cell-parsing
-functions, which is why all three live in one repo rather than three.
+## What it does
 
-## ipynb-nvim: editing
+- **`<leader>nr`** — launches `marimo edit --watch` for the current file and opens
+  the browser (or, over SSH, prints the URL to open on your laptop).
+- **`<leader>na`** — inserts a new `@app.cell`. If the buffer isn't a marimo
+  notebook yet (no `app = marimo.App()`), bootstraps the full file structure first —
+  this is exactly how you'd start a brand-new notebook from an empty `.py` file.
+- **Nothing else.** No custom filetype, no buffer transform, no shadow buffer, no
+  execution server. Both keymaps are bound in `ftplugin/python.lua`, active on any
+  `.py` file — there's no "is this actually a marimo notebook" detection, since
+  pressing `<leader>nr` on a plain/empty `.py` file is exactly how you'd start one.
 
-`.ipynb` files are JSON. This plugin intercepts opening/saving them (`BufReadCmd`/
-`BufWriteCmd`) and transforms them into a plain-text view: one `# %% 💻` marker per
-code cell, `# %% 📝` per markdown cell, with the cell's raw source underneath. Saving
-reverses the transform back to notebook JSON.
+## Real LSP, for free
 
-- **Real syntax highlighting**: the buffer's filetype is a custom `ipynb` (not
-  `python`), so no LSP ever attaches and complains about markdown prose — but since
-  `# %%` markers are valid Python comments, Tree-sitter is pointed at the Python
-  parser for this filetype, giving code cells real highlighting for free. Markdown
-  cell prose stays plain, unstyled text — no rendering, just editable text.
-- **A cell actually looks like a cell**: a border bar above and below each one (drawn
-  as extmarks, doesn't touch buffer text), and non-italic, bold headers (`❗`-style
-  Tree-sitter comment styling is deliberately overridden with `nocombine`).
-- **Fidelity on save**: cell `outputs`/`execution_count`/`metadata` you don't see in
-  the buffer are preserved on write, for any cell whose position and type haven't
-  changed since the last read/write — editing a cell's code leaves its last output in
-  place, exactly like real Jupyter does until you re-run it.
-- **Commands/keymaps**: `<leader>na` new code cell, `<leader>nA` new markdown cell,
-  `<leader>nd` delete current cell, `<leader>nm` toggle code ↔ markdown.
+pyright already attaches to marimo `.py` files through your existing global LSP
+config (`filetype = "python"`, same as any other Python file) — full diagnostics,
+hover, go-to-definition, rename, references, autotrigger completion, all of it,
+with nothing this plugin does or needs to do. Import resolution for whatever your
+notebook imports (marimo itself, pandas, plotly, ...) is standard pyright/Python
+project configuration — e.g. a `.venv` in the notebook's own directory, which
+pyright auto-detects — not something this plugin manages.
 
-**Known limitation**: cell identity is tracked by position, not a stable id —
-inserting/deleting a cell shifts everything after it, so cells after that point lose
-their preserved outputs on that save.
-
-## ipynb-run-nvim: execution
-
-- **`<leader>nr`** runs the cell under the cursor; **`<leader>nR`** runs every cell,
-  top to bottom.
-- **A real kernel**: each open notebook gets one persistent `ipykernel` process (the
-  same kernel implementation Jupyter itself uses, launched via `jupyter_client`), so
-  variables set in one cell are usable in a later one — genuine process state, not
-  simulated.
-- **The browser is an execution log, not a live mirror**: every run appends a new,
-  permanent entry ("Cell N — run #M", its code, its output) to the top of the page —
-  running the same cell again adds another entry, it never replaces the last one.
-  Nothing is pushed to the browser as you type, only actual runs.
-- **Renders "every" output type** via the real mimetype IPython's formatter registry
-  produces (`text/html`, `image/png`, `image/svg+xml`, `text/plain`) — not a hardcoded
-  list of special cases. `matplotlib` works out of the box (`%matplotlib inline` runs
-  silently on kernel startup). Plotly figures (`fig.show()` or a bare trailing `fig`)
-  render as real interactive charts — the server reconstructs a `Figure` from
-  Plotly's own renderer-negotiation output and converts it to HTML itself, so ordinary
-  Plotly code works unmodified.
-- **Visible cell numbers in Neovim**: `[Cell N]` virtual text on every header line, so
-  you know what number a cell will be tagged with in the browser.
-- **Auto-opens the browser** once per buffer per Neovim session (WSL2 via
-  `cmd.exe /c start`, `xdg-open` elsewhere) — or, over SSH, prints connection
-  instructions instead (see below).
-- **Cleans up after itself**: closing the notebook buffer or quitting Neovim kills
-  that notebook's server and kernel — no orphaned processes.
-
-### How it works
-
-```
-Neovim (ipynb-run-nvim)  --curl POST-->  Python server (aiohttp + jupyter_client/ipykernel)
-                                                  |
-                                                  +--WebSocket-->  Browser tab
-```
-
-Neovim computes which cell you're on (its 1-based position among all `# %%` headers)
-and its text, then fires a non-blocking `curl POST /run`. The server submits that code
-to the kernel, tracks which execution log entry it belongs to via the kernel's
-`msg_id`, and as real Jupyter protocol messages arrive on the kernel's iopub channel,
-forwards them to every connected browser tab over WebSocket. The browser page is a
-small, dependency-free HTML/JS file — HTML output (including Plotly's embedded
-`<script>` tags) renders inside a sandboxed `<iframe sandbox="allow-scripts"
-srcdoc="...">`, since a plain `innerHTML` assignment wouldn't execute injected scripts.
-
-### Prerequisites (one-time)
+## Prerequisites (one-time)
 
 ```bash
 sudo apt install python3-pip python3-venv
-python3 -m venv ~/.local/share/nvim/ipynb-run-nvim/venv
-~/.local/share/nvim/ipynb-run-nvim/venv/bin/pip install -r server/requirements.txt
+python3 -m venv ~/.local/share/nvim/marimo-nvim/venv
+~/.local/share/nvim/marimo-nvim/venv/bin/pip install marimo
+```
+Add any library your notebooks actually `import` (pandas, plotly, matplotlib, ...)
+to this same venv, or to a separate project-local venv if you want pyright to
+resolve those imports too (see above).
+
+**For saving to actually re-run affected cells** (rather than just marking them
+stale until you click "run" in marimo's own UI), add to the notebook project's
+`pyproject.toml`:
+```toml
+[tool.marimo.runtime]
+watcher_on_save = "autorun"
 ```
 
-If installing `ipykernel` tries to compile `pyzmq` from source (can happen on very new
-Python versions without prebuilt wheels yet), use an older interpreter for this venv
-instead of fighting the compiler toolchain:
+## Using this over SSH / a remote instance
 
-```bash
-sudo apt install python3.12 python3.12-venv
-python3.12 -m venv ~/.local/share/nvim/ipynb-run-nvim/venv
-# then re-run the pip install line above
-```
-
-Any library your notebook cells `import` (pandas, plotly, matplotlib, ...) needs to be
-installed into this same venv. If the venv is missing, Neovim will `vim.notify` you
-with these exact commands rather than silently failing.
-
-### Using this over SSH / a remote instance
-
-Off by default. The server binds a random port every time by default, which is fine
-locally but awkward to tunnel. If you code on a remote box over `ssh` and want the
-browser on your local laptop:
-
-1. On the remote machine, pass a fixed port in your lazy.nvim config:
-   ```lua
-   require("ipynb-run-nvim").setup({ port = 8765 })
-   ```
-   The server still only ever binds `127.0.0.1` — fixed port or not, it's never
-   reachable except through an SSH tunnel.
-2. On your laptop, add a persistent forward to `~/.ssh/config`:
-   ```
-   Host your-remote
-     HostName <ip-or-dns>
-     User <user>
-     LocalForward 8765 127.0.0.1:8765
-   ```
-3. Connect and run a cell. Neovim detects the SSH session (`$SSH_CONNECTION`/
-   `$SSH_TTY`) and, instead of trying to launch a browser on the remote box, notifies
-   you the URL to open locally: `http://127.0.0.1:8765/`.
-
-## ipynb-lsp-nvim: real LSP support
-
-`.ipynb` buffers get a custom filetype (`ipynb`, not `python`) specifically so pyright
-never attaches directly — markdown cells are raw, unprefixed prose, and code cells can
-contain IPython magics (`%matplotlib inline`, `!pip install x`); neither is valid
-Python syntax, so a directly-attached pyright would flag both as constant syntax
-errors. Real LSP features come from a different mechanism instead:
-
-- **A hidden shadow buffer**, created per notebook, always with the exact same line
-  count as the real buffer: markdown-cell lines (and IPython magic lines) are blanked
-  to `""`, code-cell lines are copied verbatim. Because line numbers are always
-  identical between the two buffers, diagnostics/hover/definition positions never
-  need remapping — pyright attaches to this shadow buffer, not the real one.
-- **Diagnostics** appear on the real buffer live, kept in sync via a debounced resync
-  (and an immediate one right after saving) — by mirroring pyright's own
-  already-computed diagnostics onto the real buffer, not reimplementing diagnostic
-  processing.
-- **Hover (`K`) and go-to-definition (`gd`)** work as normal keymaps in the real
-  buffer — a request is proxied to the shadow buffer's pyright client, and the
-  response's rendering reuses Neovim's own default hover renderer / location-jump
-  utility (rewriting shadow-buffer URIs back to the real buffer's URI first, so
-  jumping to a symbol defined elsewhere in the same notebook lands in the visible
-  buffer, not the invisible shadow one).
-- **Completion is manual-invoke only** (`<C-x><C-o>`) via a custom `omnifunc` — not
-  autotrigger-on-`.` the way a real `.py` file gets, since Neovim's native completion
-  is hardcoded to the current buffer with no redirection hook.
-- **pyright's analysis environment is pointed at the same venv `ipynb-run-nvim`
-  actually executes cells in** (`~/.local/share/nvim/ipynb-run-nvim/venv`) — without
-  this, pyright analyzes against whatever Python it auto-detects, which can flag
-  imports as "unresolved" for packages that are genuinely installed and working in
-  the real kernel (confirmed empirically: `matplotlib` showed as unresolved until
-  this was wired up).
-
-**Known limitations**:
-- Multi-line non-Python cell magics (`%%bash`, `%%html`, `%%javascript` — magics
-  whose entire cell body isn't Python) will leak non-Python content into the shadow
-  buffer as fake code, producing bogus diagnostics for that cell; only the first
-  `%`/`!` line of a cell is blanked.
-- Completion depends on `vim.lsp.completion._lsp_to_complete_items`, a private,
-  underscore-prefixed Neovim function that could change on a future upgrade with no
-  warning.
-- Static analysis has no concept of actual kernel execution order — a notebook where
-  cell 5 runs before cell 2 can make pyright's "undefined name" diagnostics wrong
-  relative to what was really executed. Shared by any static-analysis approach, not
-  fixable here.
-- Manual completion invoked in the exact same instant as the last keystroke (no
-  pause at all) could theoretically see a not-yet-synced shadow buffer, since the
-  debounced sync can't run synchronously from inside an `omnifunc` callback (Neovim's
-  textlock disallows buffer mutation there). Not observed in normal typing.
-
-## Installation
-
-Both plugins are wired into Neovim via a single `dir`-based lazy.nvim spec:
+Off by default — the port marimo picks (it self-selects starting at `2718`,
+auto-incrementing if that's taken) changes based on what else is running, which is
+awkward to tunnel reliably. If you code on a remote box over `ssh` and want the
+browser on your laptop, pin a fixed port:
 
 ```lua
-return {
-  dir = "/path/to/ipynb.nvim", -- or use lazy.nvim's normal `"n-llx/ipynb.nvim"` form
-  name = "ipynb.nvim",
-  lazy = false, -- must load before any .ipynb file is opened
-  config = function()
-    require("ipynb-nvim").setup()
-    require("ipynb-run-nvim").setup({ port = 0 }) -- 0 = random port (default)
-    require("ipynb-lsp-nvim").setup()
-  end,
-}
+require("marimo-nvim").setup({ port = 8765 })
 ```
 
-## Message protocol (ipynb-run-nvim)
-
-**Neovim → server (HTTP POST):**
-```json
-POST /run  { "cellId": 3, "code": "..." }
-GET  /health -> 200 "ok"
+marimo still only ever binds `127.0.0.1` — fixed port or not, it's never reachable
+except through an SSH tunnel. Add a persistent forward to `~/.ssh/config`:
 ```
-
-**Server → browser (WebSocket), tagged by `runId` (per-execution, not per-cell):**
-```json
-{ "type": "full_state", "runs": [ { "runId": 1, "cellId": 3, "code": "...", "outputs": [...] }, ... ] }
-{ "type": "run_started", "runId": 4, "cellId": 3, "code": "..." }
-{ "type": "output", "runId": 4, "kind": "stream", "stream": "stdout", "text": "..." }
-{ "type": "output", "runId": 4, "kind": "result", "mimetype": "text/html", "data": "..." }
-{ "type": "output", "runId": 4, "kind": "error", "ename": "...", "evalue": "...", "traceback": "..." }
-{ "type": "run_finished", "runId": 4 }
+Host your-remote
+  HostName <ip-or-dns>
+  User <user>
+  LocalForward 8765 127.0.0.1:8765
 ```
+Neovim detects the SSH session (`$SSH_CONNECTION`/`$SSH_TTY`) and prints the URL to
+open locally instead of trying to launch a browser on the headless remote box.
+
+## Migrating existing `.ipynb` notebooks
+
+```bash
+marimo convert notebook.ipynb -o notebook.py
+```
+Note the execution model is genuinely different, not just the file format: marimo
+builds a dependency graph from which cells define/read which variables and executes
+in that order, not top-to-bottom by position. The same variable can't be defined in
+two cells, and mutations must happen in the cell that defines the variable. Code
+written for Jupyter's manual/out-of-order execution may need real refactoring, not
+just a format conversion, to work correctly under marimo. Converting back the other
+way: `marimo export ipynb notebook.py -o notebook.ipynb --include-outputs`.
 
 ## Known limitations
 
-- Cell numbers/identity are positional, recomputed from header order — inserting or
-  deleting a cell shifts everything after it.
-- One kernel per notebook, no interrupt/restart keymap yet — a hung cell currently
-  means closing and reopening the buffer.
-- A hard `kill -9` of Neovim can orphan the kernel process (normal `:qa`/closing the
-  buffer cleans up correctly). Recovery: `pkill -f ipykernel_launcher`.
-
-See `ipynb-lsp-nvim`'s own limitations above for LSP-specific caveats.
+- No cell-boundary decorations/visuals in Neovim (no border bars, no cell numbers)
+  — marimo's own browser UI already provides polished cell visuals; duplicating
+  that in the terminal wasn't judged worth it for what's left to build here.
+- `--port 0` doesn't give a true OS-assigned ephemeral port (verified: marimo just
+  starts from its own default `2718` and increments on conflict) — in practice this
+  behaves fine for "don't worry about collisions," just with predictable rather than
+  random ports.
+- A hard `kill -9` of Neovim can orphan the marimo process (normal `:qa`/closing the
+  buffer cleans up correctly, verified across multiple cycles). Recovery:
+  `pkill -f "marimo edit"`.
 
 ## File layout
 
 ```
-lua/ipynb-nvim/init.lua          -- BufReadCmd/BufWriteCmd, cell editing commands, decorations
-lua/ipynb-run-nvim/init.lua      -- server lifecycle, cell-id computation, run commands
-lua/ipynb-lsp-nvim/init.lua      -- shadow buffer lifecycle/sync, diagnostics mirror,
-                                     hover/definition proxy, completion omnifunc
-ftplugin/ipynb.lua               -- keymaps + live decoration/cell-number/LSP-sync updates, per-buffer
-server/
-├── app.py                       -- aiohttp server: kernel manager, HTTP+WS, output routing
-├── requirements.txt             -- jupyter_client, ipykernel, aiohttp, plotly, nbformat
-└── static/index.html            -- the browser page
+lua/marimo-nvim/init.lua   -- launch/cleanup lifecycle, new-cell helper
+ftplugin/python.lua        -- keymaps, active on any .py file
 ```
